@@ -1,18 +1,29 @@
 """
 Azure DevOps PR Approver
 ------------------------
-Paste one or more Azure DevOps Pull Request URLs at the prompt,
-press Enter on a blank line, and the script will approve them all
-using your Personal Access Token stored in .env.
+Bulk-approve Azure DevOps Pull Requests from a file, clipboard, or
+interactive prompt. Uses your Personal Access Token stored in .env.
+
+Usage:
+  python approve_prs.py                     # interactive / clipboard
+  python approve_prs.py --file urls.txt     # from a text file
+  python approve_prs.py --profile work      # use AZURE_DEVOPS_PAT_WORK
 
 Supported URL format:
   https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{id}
 """
 
+import argparse
 import os
 import re
 import sys
 from pathlib import Path
+
+try:
+    import pyperclip
+    _PYPERCLIP_AVAILABLE = True
+except ImportError:
+    _PYPERCLIP_AVAILABLE = False
 
 from dotenv import load_dotenv
 import requests
@@ -21,13 +32,17 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 from rich.panel import Panel
-from rich.prompt import Prompt
+
+# ── Config toggles ─────────────────────────────────────────────────────────────
+# Set to False to disable automatic clipboard pre-fill at startup.
+CLIPBOARD_AUTO_READ = True
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 ADO_API_VERSION = "7.1"
-VOTE_APPROVED = 10  # Azure DevOps vote values: 10=Approved, 5=Approved w/ suggestions,
-                    # 0=No vote, -5=Waiting for author, -10=Rejected
+VOTE_APPROVED = 10          # Azure DevOps vote values: 10=Approved, 5=Approved w/ suggestions,
+                            # 0=No vote, -5=Waiting for author, -10=Rejected
+PR_ACTIVE_STATUS = "active" # PRs in any other status (completed, abandoned) will be skipped
 
 PR_URL_PATTERN = re.compile(
     r"https://dev\.azure\.com/(?P<org>[^/]+)/(?P<project>[^/]+)/_git/(?P<repo>[^/]+)/pullrequest/(?P<pr_id>\d+)",
@@ -39,24 +54,25 @@ console = Console()
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-def load_pat() -> str:
-    """Load PAT from .env file in the same directory as this script."""
+def load_pat(profile: str | None = None) -> str:
+    """Load PAT from .env. Pass profile name to use AZURE_DEVOPS_PAT_{PROFILE}."""
     env_path = Path(__file__).parent / ".env"
     if not env_path.exists():
-        example_path = Path(__file__).parent / ".env.example"
         console.print(
             f"[bold red]ERROR:[/] .env file not found.\n"
-            f"Copy [cyan].env.example[/] → [cyan].env[/] and fill in your PAT.\n"
+            f"Copy [cyan].env.example[/] \u2192 [cyan].env[/] and fill in your PAT.\n"
             f"Expected path: {env_path}",
             highlight=False,
         )
         sys.exit(1)
     load_dotenv(env_path)
-    pat = os.getenv("AZURE_DEVOPS_PAT", "").strip()
+    env_key = f"AZURE_DEVOPS_PAT_{profile.upper()}" if profile else "AZURE_DEVOPS_PAT"
+    pat = os.getenv(env_key, "").strip()
     if not pat or pat == "your_personal_access_token_here":
-        console.print(
-            "[bold red]ERROR:[/] AZURE_DEVOPS_PAT is not set in your .env file."
-        )
+        msg = f"[bold red]ERROR:[/] [cyan]{env_key}[/] is not set in your .env file."
+        if profile:
+            msg += f"\n[dim]Add it as: {env_key}=your_token[/]"
+        console.print(msg)
         sys.exit(1)
     return pat
 
@@ -69,8 +85,42 @@ def parse_pr_url(url: str) -> dict:
     return match.groupdict() | {"pr_id": int(match.group("pr_id"))}
 
 
-def collect_pr_urls() -> list[str]:
-    """Interactively collect PR URLs from the user."""
+def _extract_pr_urls(text: str) -> list[str]:
+    """Pull every ADO PR URL out of an arbitrary block of text."""
+    return [m.group(0) for m in PR_URL_PATTERN.finditer(text)]
+
+
+def collect_pr_urls(file_path: str | None = None) -> list[str]:
+    """Collect PR URLs from a --file, clipboard pre-fill, or interactive prompt."""
+
+    # ── From file (─────────────────────────────────────────────────────
+    if file_path:
+        path = Path(file_path)
+        if not path.exists():
+            console.print(f"[bold red]ERROR:[/] File not found: {file_path}")
+            sys.exit(1)
+        urls = [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        console.print(f"[dim]Loaded {len(urls)} URL(s) from [cyan]{file_path}[/][/]")
+        return urls
+
+    # ── Clipboard pre-fill ──────────────────────────────────────────────────
+    clipboard_urls: list[str] = []
+    if CLIPBOARD_AUTO_READ and _PYPERCLIP_AVAILABLE:
+        try:
+            clipboard_urls = _extract_pr_urls(pyperclip.paste())
+            if clipboard_urls:
+                console.print(
+                    f"[dim]\U0001f4cb Clipboard has {len(clipboard_urls)} PR URL(s) — "
+                    f"press [bold]Enter[/] on a blank line immediately to use them.[/]"
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── Interactive prompt ────────────────────────────────────────────────
     console.print(
         Panel(
             "[bold cyan]Azure DevOps PR Approver[/]\n\n"
@@ -89,6 +139,8 @@ def collect_pr_urls() -> list[str]:
         if not line:
             if urls:
                 break
+            if clipboard_urls:
+                return clipboard_urls  # blank Enter immediately → use clipboard
             console.print("[dim]  (enter at least one URL)[/]")
         else:
             urls.append(line)
@@ -104,8 +156,8 @@ def get_current_user_id(org: str, auth: HTTPBasicAuth) -> str:
 
 
 def get_pr_info(org: str, project: str, repo: str, pr_id: int,
-                reviewer_id: str, auth: HTTPBasicAuth) -> tuple[str, bool]:
-    """Fetch PR title and whether the current user has already approved."""
+                reviewer_id: str, auth: HTTPBasicAuth) -> tuple[str, bool, str, str]:
+    """Fetch PR title, already-approved flag, PR status, and author display name."""
     url = (
         f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/"
         f"{repo}/pullRequests/{pr_id}?api-version={ADO_API_VERSION}"
@@ -114,11 +166,13 @@ def get_pr_info(org: str, project: str, repo: str, pr_id: int,
     resp.raise_for_status()
     data = resp.json()
     title = data.get("title", f"PR #{pr_id}")
+    pr_status = data.get("status", PR_ACTIVE_STATUS).lower()
+    author_name = data.get("createdBy", {}).get("displayName", "\u2014")
     already_approved = any(
         r.get("id") == reviewer_id and r.get("vote") == VOTE_APPROVED
         for r in data.get("reviewers", [])
     )
-    return title, already_approved
+    return title, already_approved, pr_status, author_name
 
 
 def approve_pr(org: str, project: str, repo: str, pr_id: int,
@@ -142,10 +196,24 @@ def approve_pr(org: str, project: str, repo: str, pr_id: int,
 
 
 def main() -> None:
-    pat = load_pat()
+    # ── CLI arguments ────────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(description="Bulk-approve Azure DevOps Pull Requests.")
+    parser.add_argument(
+        "--file", "-f",
+        metavar="PATH",
+        help="Path to a .txt file with one PR URL per line (lines starting with # are ignored).",
+    )
+    parser.add_argument(
+        "--profile", "-p",
+        metavar="NAME",
+        help="PAT profile to use. Reads AZURE_DEVOPS_PAT_{NAME} from .env (e.g. --profile work).",
+    )
+    args = parser.parse_args()
+
+    pat = load_pat(args.profile)
     auth = HTTPBasicAuth("", pat)  # ADO: username can be anything, password = PAT
 
-    raw_urls = collect_pr_urls()
+    raw_urls = collect_pr_urls(args.file)
 
     # ── Parse & validate URLs ────────────────────────────────────────────────
     parsed: list[dict] = []
@@ -194,9 +262,11 @@ def main() -> None:
             try:
                 user_ids[org] = get_current_user_id(org, auth)
             except requests.HTTPError as exc:
+                status_code = exc.response.status_code
+                reason = exc.response.reason
+                hint = " \u2014 PAT may be expired or missing Code scope." if status_code == 401 else ""
                 console.print(
-                    f"[bold red]AUTH FAILED[/] for org '{org}': {exc.response.status_code} "
-                    f"{exc.response.reason}"
+                    f"[bold red]AUTH FAILED[/] for org '{org}': {status_code} {reason}{hint}"
                 )
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[bold red]AUTH ERROR[/] for org '{org}': {exc}")
@@ -206,39 +276,45 @@ def main() -> None:
         sys.exit(1)
 
     # ── Approve each PR ──────────────────────────────────────────────────────
-    results: list[tuple[str, str, str, str]] = []  # (pr_ref, title, status, detail)
+    results: list[tuple[str, str, str, str, str]] = []  # (pr_ref, title, author, status, detail)
 
     console.print()
     for item in parsed:
         org, project, repo, pr_id = item["org"], item["project"], item["repo"], item["pr_id"]
         pr_ref = f"{org}/{project} → PR #{pr_id}"
         title = f"PR #{pr_id}"
+        author = "—"
 
         if org not in user_ids:
-            results.append((pr_ref, title, "SKIPPED", "Auth failed for org"))
+            results.append((pr_ref, title, author, "SKIPPED", "Auth failed for org"))
             continue
 
-        # Fetch PR title + check if already approved
+        # Fetch PR info: title, already-approved, PR status, author
         try:
-            title, already_approved = get_pr_info(org, project, repo, pr_id, user_ids[org], auth)
+            title, already_approved, pr_status, author = get_pr_info(
+                org, project, repo, pr_id, user_ids[org], auth
+            )
+            if pr_status != PR_ACTIVE_STATUS:
+                results.append((pr_ref, title, author, "SKIPPED", f"PR is {pr_status}"))
+                continue
             if already_approved:
-                results.append((pr_ref, title, "ALREADY APPROVED", ""))
+                results.append((pr_ref, title, author, "ALREADY APPROVED", ""))
                 continue
         except Exception:  # noqa: BLE001
-            pass  # non-fatal — proceed with approve
+            pass  # non-fatal — proceed with approve attempt
 
         try:
             approve_pr(org, project, repo, pr_id, user_ids[org], auth)
-            results.append((pr_ref, title, "APPROVED", ""))
+            results.append((pr_ref, title, author, "APPROVED", ""))
         except requests.HTTPError as exc:
             status_code = exc.response.status_code
             try:
                 detail = exc.response.json().get("message", exc.response.reason)
             except Exception:  # noqa: BLE001
                 detail = exc.response.reason
-            results.append((pr_ref, title, "FAILED", f"HTTP {status_code}: {detail}"))
+            results.append((pr_ref, title, author, "FAILED", f"HTTP {status_code}: {detail}"))
         except Exception as exc:  # noqa: BLE001
-            results.append((pr_ref, title, "FAILED", str(exc)))
+            results.append((pr_ref, title, author, "FAILED", str(exc)))
 
     # ── Summary table ────────────────────────────────────────────────────────
     status_styles = {
@@ -250,21 +326,22 @@ def main() -> None:
 
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta")
     table.add_column("Pull Request", style="cyan", no_wrap=True)
-    table.add_column("Title", style="white", max_width=45)
+    table.add_column("Title", style="white", max_width=40)
+    table.add_column("Author", style="dim", max_width=22)
     table.add_column("Status", justify="center")
     table.add_column("Detail", style="dim")
 
-    for pr_ref, title, status, detail in results:
+    for pr_ref, title, author, status, detail in results:
         style = status_styles.get(status, "white")
-        table.add_row(pr_ref, title, f"[{style}]{status}[/]", detail)
+        table.add_row(pr_ref, title, author, f"[{style}]{status}[/]", detail)
 
     console.print()
     console.print(table)
 
-    approved = sum(1 for _, _, s, _ in results if s == "APPROVED")
-    already  = sum(1 for _, _, s, _ in results if s == "ALREADY APPROVED")
-    failed   = sum(1 for _, _, s, _ in results if s == "FAILED")
-    skipped  = sum(1 for _, _, s, _ in results if s == "SKIPPED")
+    approved = sum(1 for _, _, _, s, _ in results if s == "APPROVED")
+    already  = sum(1 for _, _, _, s, _ in results if s == "ALREADY APPROVED")
+    failed   = sum(1 for _, _, _, s, _ in results if s == "FAILED")
+    skipped  = sum(1 for _, _, _, s, _ in results if s == "SKIPPED")
     console.print(
         f"\n[bold]Done.[/]  "
         f"[green]Approved: {approved}[/]  "
