@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PR URLs Example File
+# ─────────────────────────────────────────────────────────────────────────────
+# One URL per line. Lines starting with # are treated as comments and ignored.
+# Blank lines are also ignored.
+#
+# Usage:
+#   python approve_prs.py --file urls.example.txt
+#   python approve_prs.py -f my-sprint-prs.txt
+#
+# Tip: copy this file, rename it (e.g. sprint-42.txt), fill in your URLs.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Sprint 42 — Backend
+https://dev.azure.com/your-org/your-project/_git/backend-api/pullrequest/1001
+https://dev.azure.com/your-org/your-project/_git/backend-api/pullrequest/1002
+
+# Sprint 42 — Frontend
+https://dev.azure.com/your-org/your-project/_git/frontend-app/pullrequest/2001
+
+# Hotfix
+https://dev.azure.com/your-org/your-project/_git/backend-api/pullrequest/1099

@@ -2,6 +2,8 @@
 
 > **Bulk-approve Azure DevOps Pull Requests in seconds — no browser, no clicking, just Python.**
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 ---
 
 ## 📋 Table of Contents
@@ -23,6 +25,7 @@
 - [URL Format](#-url-format)
 - [Vote Reference](#-vote-reference)
 - [Troubleshooting](#-troubleshooting)
+- [License](#-license)
 - [Changelog](#-changelog)
 
 ---
@@ -45,11 +48,13 @@ Provide Azure DevOps PR URLs via interactive prompt, a text file, or your clipbo
 ## 📁 Project Structure
 
 ```
-pr-approver/
-├── approve_prs.py      ← main script
-├── requirements.txt    ← Python dependencies
-├── .env.example        ← template — copy this to .env and fill in your PAT
-└── .env                ← your secrets (never commit this!)
+ado-bulk-approver/
+├── approve_prs.py        ← main script
+├── requirements.txt      ← Python dependencies
+├── urls.example.txt      ← example URL file for --file mode
+├── .env.example          ← template — copy this to .env and fill in your PAT
+├── .env                  ← your secrets (never commit this!)
+└── LICENSE               ← MIT License
 ```
 
 ---
@@ -198,7 +203,16 @@ Done.  Approved: 2  Already approved: 0  Failed: 0  Skipped: 0
 Create a plain text file with one PR URL per line.
 Lines starting with `#` are treated as comments and ignored.
 
-```text
+A ready-to-use example is included in the repo — `urls.example.txt`:
+
+```bash
+# Copy and edit the example
+cp urls.example.txt my-sprint-prs.txt
+# Then run
+python approve_prs.py --file my-sprint-prs.txt
+```
+
+Example file format:
 # Sprint 42 PRs
 https://dev.azure.com/myorg/myproject/_git/backend/pullrequest/201
 https://dev.azure.com/myorg/myproject/_git/frontend/pullrequest/202
@@ -333,6 +347,13 @@ To change the vote, edit `VOTE_APPROVED` at the top of `approve_prs.py`.
 
 ## 📝 Changelog
 
+### 2026-04-28 — v4: MIT License + example URL file
+
+| Addition | Details |
+|---|---|
+| `LICENSE` | MIT License added to the repository |
+| `urls.example.txt` | Example URL file for `--file` mode — copy, rename, fill in your PRs |
+
 ### 2026-04-28 — v3: File input, Clipboard, Multi-Profile, PR Status check
 
 | Feature | Details |
@@ -361,4 +382,10 @@ To change the vote, edit `VOTE_APPROVED` at the top of `approve_prs.py`.
 
 ---
 
-> Built with Python · `requests` · `python-dotenv` · `rich`
+## 📄 License
+
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+
+---
+
+> Built with Python · `requests` · `python-dotenv` · `rich` · `pyperclip` · MIT Licensed
