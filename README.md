@@ -225,6 +225,7 @@ To change the vote, edit `VOTE_APPROVED` at the top of `approve_prs.py`.
 
 | Date | Change |
 |---|---|
+| 2026-04-28 | Added confirmation prompt, duplicate URL deduplication, PR title in results table, already-approved detection |
 | 2026-04-27 | Initial version — bulk approve via interactive prompt, PAT auth, rich summary table |
 
 ---

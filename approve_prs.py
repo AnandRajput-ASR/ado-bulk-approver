@@ -103,6 +103,24 @@ def get_current_user_id(org: str, auth: HTTPBasicAuth) -> str:
     return resp.json()["id"]
 
 
+def get_pr_info(org: str, project: str, repo: str, pr_id: int,
+                reviewer_id: str, auth: HTTPBasicAuth) -> tuple[str, bool]:
+    """Fetch PR title and whether the current user has already approved."""
+    url = (
+        f"https://dev.azure.com/{org}/{project}/_apis/git/repositories/"
+        f"{repo}/pullRequests/{pr_id}?api-version={ADO_API_VERSION}"
+    )
+    resp = requests.get(url, auth=auth, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    title = data.get("title", f"PR #{pr_id}")
+    already_approved = any(
+        r.get("id") == reviewer_id and r.get("vote") == VOTE_APPROVED
+        for r in data.get("reviewers", [])
+    )
+    return title, already_approved
+
+
 def approve_pr(org: str, project: str, repo: str, pr_id: int,
                reviewer_id: str, auth: HTTPBasicAuth) -> dict:
     """
@@ -141,6 +159,32 @@ def main() -> None:
         console.print("[red]No valid PR URLs to process. Exiting.[/]")
         sys.exit(1)
 
+    # ── Deduplicate URLs ─────────────────────────────────────────────────────
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in parsed:
+        key = item["url"].lower().rstrip("/")
+        if key in seen:
+            console.print(f"[dim]DUPLICATE skipped:[/] {item['url']}")
+        else:
+            seen.add(key)
+            unique.append(item)
+    parsed = unique
+
+    # ── Confirm before approving ─────────────────────────────────────────────
+    console.print(f"\n[bold]Ready to approve {len(parsed)} PR(s):[/]")
+    for item in parsed:
+        console.print(f"  [cyan]•[/] {item['org']}/{item['project']} → PR #{item['pr_id']}")
+    console.print()
+    try:
+        confirm = input("  Approve all? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]Cancelled.[/]")
+        sys.exit(0)
+    if confirm != "y":
+        console.print("[yellow]Aborted.[/]")
+        sys.exit(0)
+
     # ── Resolve reviewer IDs (once per unique org) ───────────────────────────
     orgs: set[str] = {p["org"] for p in parsed}
     user_ids: dict[str, str] = {}
@@ -162,51 +206,69 @@ def main() -> None:
         sys.exit(1)
 
     # ── Approve each PR ──────────────────────────────────────────────────────
-    results: list[tuple[str, str, str]] = []  # (pr_ref, status, detail)
+    results: list[tuple[str, str, str, str]] = []  # (pr_ref, title, status, detail)
 
     console.print()
     for item in parsed:
         org, project, repo, pr_id = item["org"], item["project"], item["repo"], item["pr_id"]
         pr_ref = f"{org}/{project} → PR #{pr_id}"
+        title = f"PR #{pr_id}"
 
         if org not in user_ids:
-            results.append((pr_ref, "SKIPPED", "Auth failed for org"))
+            results.append((pr_ref, title, "SKIPPED", "Auth failed for org"))
             continue
+
+        # Fetch PR title + check if already approved
+        try:
+            title, already_approved = get_pr_info(org, project, repo, pr_id, user_ids[org], auth)
+            if already_approved:
+                results.append((pr_ref, title, "ALREADY APPROVED", ""))
+                continue
+        except Exception:  # noqa: BLE001
+            pass  # non-fatal — proceed with approve
 
         try:
             approve_pr(org, project, repo, pr_id, user_ids[org], auth)
-            results.append((pr_ref, "APPROVED", ""))
+            results.append((pr_ref, title, "APPROVED", ""))
         except requests.HTTPError as exc:
             status_code = exc.response.status_code
             try:
                 detail = exc.response.json().get("message", exc.response.reason)
             except Exception:  # noqa: BLE001
                 detail = exc.response.reason
-            results.append((pr_ref, "FAILED", f"HTTP {status_code}: {detail}"))
+            results.append((pr_ref, title, "FAILED", f"HTTP {status_code}: {detail}"))
         except Exception as exc:  # noqa: BLE001
-            results.append((pr_ref, "FAILED", str(exc)))
+            results.append((pr_ref, title, "FAILED", str(exc)))
 
     # ── Summary table ────────────────────────────────────────────────────────
+    status_styles = {
+        "APPROVED": "bold green",
+        "ALREADY APPROVED": "dim green",
+        "SKIPPED": "yellow",
+        "FAILED": "bold red",
+    }
+
     table = Table(box=box.ROUNDED, show_header=True, header_style="bold magenta")
     table.add_column("Pull Request", style="cyan", no_wrap=True)
+    table.add_column("Title", style="white", max_width=45)
     table.add_column("Status", justify="center")
     table.add_column("Detail", style="dim")
 
-    status_styles = {"APPROVED": "bold green", "SKIPPED": "yellow", "FAILED": "bold red"}
-
-    for pr_ref, status, detail in results:
+    for pr_ref, title, status, detail in results:
         style = status_styles.get(status, "white")
-        table.add_row(pr_ref, f"[{style}]{status}[/]", detail)
+        table.add_row(pr_ref, title, f"[{style}]{status}[/]", detail)
 
     console.print()
     console.print(table)
 
-    approved = sum(1 for _, s, _ in results if s == "APPROVED")
-    failed = sum(1 for _, s, _ in results if s == "FAILED")
-    skipped = sum(1 for _, s, _ in results if s == "SKIPPED")
+    approved = sum(1 for _, _, s, _ in results if s == "APPROVED")
+    already  = sum(1 for _, _, s, _ in results if s == "ALREADY APPROVED")
+    failed   = sum(1 for _, _, s, _ in results if s == "FAILED")
+    skipped  = sum(1 for _, _, s, _ in results if s == "SKIPPED")
     console.print(
         f"\n[bold]Done.[/]  "
         f"[green]Approved: {approved}[/]  "
+        f"[dim green]Already approved: {already}[/]  "
         f"[red]Failed: {failed}[/]  "
         f"[yellow]Skipped: {skipped}[/]"
     )
